@@ -1,6 +1,5 @@
 ﻿using System.Diagnostics;
 using System.IO.Compression;
-using System.Text.Json;
 
 namespace Consoleify.GoogleTVNetworkCEC
 {
@@ -9,54 +8,74 @@ namespace Consoleify.GoogleTVNetworkCEC
         private static readonly string AdbDirPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "platform-tools");
         private static readonly string AdbExePath = Path.Combine(AdbDirPath, "adb.exe");
         private const string AdbDownloadUrl = "https://dl.google.com/android/repository/platform-tools-latest-windows.zip";
+        private static string? _connectedTvIp = null;
 
         public static async Task EnsureAdbInstalledAsync()
         {
             if (File.Exists(AdbExePath)) return;
 
             string zipPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "platform-tools.zip");
+            Logger.Info("Downloading ADB platform-tools...");
 
-            using (HttpClient client = new HttpClient())
+            using (var client = new HttpClient { Timeout = TimeSpan.FromMinutes(2) })
             {
                 byte[] zipBytes = await client.GetByteArrayAsync(AdbDownloadUrl);
-                File.WriteAllBytes(zipPath, zipBytes);
+                await File.WriteAllBytesAsync(zipPath, zipBytes);
             }
 
             if (Directory.Exists(AdbDirPath)) Directory.Delete(AdbDirPath, true);
             ZipFile.ExtractToDirectory(zipPath, AppDomain.CurrentDomain.BaseDirectory);
             File.Delete(zipPath);
+            Logger.Success("ADB platform-tools installed.");
         }
 
         public static async Task WakeAndSwitchTV()
         {
             AppConfig config = AppConfig.Load();
-
             string tvIp = config.TvIpAddress;
             string hdmiCommand = config.HdmiCommand;
 
             if (string.IsNullOrWhiteSpace(tvIp))
             {
-                System.Diagnostics.Debug.WriteLine("ERROR: TV IP Address is not set in settings.json.");
+                Logger.Error("TV IP Address is not set in settings.");
                 return;
             }
 
             if (string.IsNullOrWhiteSpace(hdmiCommand))
             {
-                System.Diagnostics.Debug.WriteLine("ERROR: HDMI command is not set in settings.json.");
+                Logger.Error("HDMI command is not set in settings.");
                 return;
             }
 
-            System.Diagnostics.Debug.WriteLine($"Connecting to TV at {tvIp}...");
+            if (_connectedTvIp != tvIp)
+            {
+                Logger.Info($"Connecting to TV at {tvIp}...");
+                bool connected = await RunProcessAsync(AdbExePath, $"connect {tvIp}");
+                if (!connected)
+                {
+                    Logger.Error($"Failed to connect to TV at {tvIp}.");
+                    return;
+                }
+                _connectedTvIp = tvIp;
+            }
 
-            RunProcess(AdbExePath, $"connect {tvIp}", true);
+            bool woke = await RunProcessAsync(AdbExePath, "shell input keyevent KEYCODE_WAKEUP");
+            bool switched = await RunProcessAsync(AdbExePath, $"shell {hdmiCommand}");
 
-            RunProcess(AdbExePath, "shell input keyevent KEYCODE_WAKEUP", false);
-            RunProcess(AdbExePath, $"shell {hdmiCommand}", false);
+            if (!woke || !switched)
+            {
+                Logger.Warning("Wake or HDMI switch command failed. Will reconnect on next attempt.");
+                _connectedTvIp = null;
+            }
+            else
+            {
+                Logger.Success("TV wake and HDMI switch sent successfully.");
+            }
         }
 
-        private static void RunProcess(string fileName, string args, bool waitForExit)
+        private static async Task<bool> RunProcessAsync(string fileName, string args)
         {
-            ProcessStartInfo psi = new ProcessStartInfo
+            var psi = new ProcessStartInfo
             {
                 FileName = fileName,
                 Arguments = args,
@@ -67,15 +86,23 @@ namespace Consoleify.GoogleTVNetworkCEC
 
             try
             {
-                using (Process process = Process.Start(psi))
-                {
-                    if (waitForExit && process != null)
-                    {
-                        process.WaitForExit(3000);
-                    }
-                }
+                using var process = Process.Start(psi);
+                if (process == null) return false;
+
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                await process.WaitForExitAsync(cts.Token);
+                return process.ExitCode == 0;
             }
-            catch { System.Diagnostics.Debug.WriteLine($"Failed to run: {args}"); }
+            catch (OperationCanceledException)
+            {
+                Logger.Warning($"Process timed out: {args}");
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"Failed to run process '{args}': {ex.Message}");
+                return false;
+            }
         }
     }
 }

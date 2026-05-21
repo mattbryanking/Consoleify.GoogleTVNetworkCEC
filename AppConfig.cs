@@ -9,7 +9,9 @@ namespace Consoleify.GoogleTVNetworkCEC
         public string TvIpAddress { get; set; } = "";
         public string HdmiCommand { get; set; } = "";
 
-        private static readonly string ConfigPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.json");
+        private static readonly string ConfigDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Consoleify");
+        private static readonly string ConfigPath = Path.Combine(ConfigDirectory, "NetworkCEC-settings.json");
 
         public static AppConfig Load()
         {
@@ -20,12 +22,21 @@ namespace Consoleify.GoogleTVNetworkCEC
                 return defaultConfig;
             }
 
-            string json = File.ReadAllText(ConfigPath);
-            return JsonSerializer.Deserialize<AppConfig>(json) ?? new AppConfig();
+            try
+            {
+                string json = File.ReadAllText(ConfigPath);
+                return JsonSerializer.Deserialize<AppConfig>(json) ?? new AppConfig();
+            }
+            catch (JsonException ex)
+            {
+                Logger.Error($"Settings file is corrupted, using defaults: {ex.Message}");
+                return new AppConfig();
+            }
         }
 
         public void Save()
         {
+            Directory.CreateDirectory(ConfigDirectory);
             var options = new JsonSerializerOptions { WriteIndented = true };
             string json = JsonSerializer.Serialize(this, options);
             File.WriteAllText(ConfigPath, json);

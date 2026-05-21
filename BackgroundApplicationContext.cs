@@ -6,11 +6,12 @@ namespace Consoleify.GoogleTVNetworkCEC
 {
     public class BackgroundApplicationContext : ApplicationContext
     {
-        private Timer pollTimer;
-        private DateTime lastCommandTime = DateTime.MinValue;
-        private readonly TimeSpan commandCooldown = TimeSpan.FromSeconds(5);
-
-        private int lastGamepadPacket = 0;
+        private readonly Timer _pollTimer;
+        private DateTime _lastCommandTime = DateTime.MinValue;
+        private readonly TimeSpan _commandCooldown = TimeSpan.FromSeconds(5);
+        private int _lastGamepadPacket = 0;
+        private bool _isPolling = false;
+        private readonly Task _adbInitTask;
 
         public BackgroundApplicationContext(bool isSilent)
         {
@@ -19,52 +20,71 @@ namespace Consoleify.GoogleTVNetworkCEC
                 new SettingsForm().Show();
             }
 
-            InitializeAdb();
+            _adbInitTask = AdbManager.EnsureAdbInstalledAsync();
 
-            pollTimer = new Timer { Interval = 1000 };
-            pollTimer.Tick += PollInput;
-            pollTimer.Start();    
+            _pollTimer = new Timer { Interval = 1000 };
+            _pollTimer.Tick += PollInput;
+            _pollTimer.Start();
         }
 
-        private async void InitializeAdb()
+        private async void PollInput(object? sender, EventArgs e)
         {
-            await AdbManager.EnsureAdbInstalledAsync();
-            System.Diagnostics.Debug.WriteLine("ADB Environment Ready.");
+            if (_isPolling) return;
+            _isPolling = true;
+
+            try
+            {
+                try { await _adbInitTask; }
+                catch (Exception ex)
+                {
+                    Logger.Error($"ADB initialization failed, skipping poll: {ex.Message}");
+                    return;
+                }
+
+                bool inputDetected = false;
+
+                for (int i = 8; i < 255; i++)
+                {
+                    if ((GetAsyncKeyState(i) & 0x8001) != 0)
+                    {
+                        Logger.Info($"[TRIGGER] Keyboard key pressed (Code: {i})");
+                        inputDetected = true;
+                        break;
+                    }
+                }
+
+                XINPUT_STATE xState = new XINPUT_STATE();
+                if (XInputGetState(0, ref xState) == 0)
+                {
+                    if (_lastGamepadPacket != 0 && xState.dwPacketNumber != _lastGamepadPacket)
+                    {
+                        Logger.Info("[TRIGGER] Gamepad input detected.");
+                        inputDetected = true;
+                    }
+                    _lastGamepadPacket = (int)xState.dwPacketNumber;
+                }
+
+                if (inputDetected && (DateTime.UtcNow - _lastCommandTime) > _commandCooldown)
+                {
+                    Logger.Info("Input detected, sending wake command to TV...");
+                    _lastCommandTime = DateTime.UtcNow;
+                    await AdbManager.WakeAndSwitchTV();
+                }
+            }
+            finally
+            {
+                _isPolling = false;
+            }
         }
 
-        private async void PollInput(object sender, EventArgs e)
+        protected override void Dispose(bool disposing)
         {
-            bool inputDetected = false;
-
-            for (int i = 8; i < 255; i++)
+            if (disposing)
             {
-
-                if ((GetAsyncKeyState(i) & 0x8001) != 0)
-                {
-                    System.Diagnostics.Debug.WriteLine($"[TRIGGER] Keyboard key pressed (Code: {i})");
-                    inputDetected = true;
-                    break; 
-                }
+                _pollTimer.Stop();
+                _pollTimer.Dispose();
             }
-
-            XINPUT_STATE xState = new XINPUT_STATE();
-            if (XInputGetState(0, ref xState) == 0)
-            {
-                if (lastGamepadPacket != 0 && xState.dwPacketNumber != lastGamepadPacket)
-                {
-                    System.Diagnostics.Debug.WriteLine($"[TRIGGER] Gamepad caused input! (Packet changed)");
-                    inputDetected = true;
-                }
-                lastGamepadPacket = (int)xState.dwPacketNumber;
-            }
-
-            System.Diagnostics.Debug.WriteLine($"About to check! Time: {DateTime.Now.ToString("HH:mm:ss")}");
-            if (inputDetected && (DateTime.Now - lastCommandTime) > commandCooldown)
-            {
-                System.Diagnostics.Debug.WriteLine("Keyboard/Gamepad input detected, sending wake command to TV...");
-                lastCommandTime = DateTime.Now;
-                await AdbManager.WakeAndSwitchTV();
-            }
+            base.Dispose(disposing);
         }
 
         [DllImport("User32.dll")]
