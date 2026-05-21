@@ -1,6 +1,8 @@
 ﻿using System;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 using Timer = System.Windows.Forms.Timer;
+using SDL3; 
 
 namespace Consoleify.GoogleTVNetworkCEC
 {
@@ -9,9 +11,10 @@ namespace Consoleify.GoogleTVNetworkCEC
         private readonly Timer _pollTimer;
         private DateTime _lastCommandTime = DateTime.MinValue;
         private readonly TimeSpan _commandCooldown = TimeSpan.FromSeconds(5);
-        private int _lastGamepadPacket = 0;
         private bool _isPolling = false;
         private readonly Task _adbInitTask;
+
+        private bool _sdlInitialized = false;
 
         public BackgroundApplicationContext(bool isSilent)
         {
@@ -21,6 +24,16 @@ namespace Consoleify.GoogleTVNetworkCEC
             }
 
             _adbInitTask = AdbManager.EnsureAdbInstalledAsync();
+
+            // sdl3 covers xinput, directinput, and steam controllers
+            if (SDL.Init(SDL.InitFlags.Gamepad))
+            {
+                _sdlInitialized = true;
+            }
+            else
+            {
+                Logger.Error($"Failed to initialize SDL3: {SDL.GetError()}");
+            }
 
             _pollTimer = new Timer { Interval = 1000 };
             _pollTimer.Tick += PollInput;
@@ -43,6 +56,7 @@ namespace Consoleify.GoogleTVNetworkCEC
 
                 bool inputDetected = false;
 
+                // sdl3 can't do global keyboard hooking without a focused window, fall back to win32
                 for (int i = 8; i < 255; i++)
                 {
                     if ((GetAsyncKeyState(i) & 0x8001) != 0)
@@ -53,15 +67,42 @@ namespace Consoleify.GoogleTVNetworkCEC
                     }
                 }
 
-                XINPUT_STATE xState = new XINPUT_STATE();
-                if (XInputGetState(0, ref xState) == 0)
+                // drain the sdl event queue
+                if (_sdlInitialized)
                 {
-                    if (_lastGamepadPacket != 0 && xState.dwPacketNumber != _lastGamepadPacket)
+                    while (SDL.PollEvent(out var sdlEvent))
                     {
-                        Logger.Info("[TRIGGER] Gamepad input detected.");
-                        inputDetected = true;
+                        var eventType = (SDL.EventType)sdlEvent.Type;
+
+                        if (eventType == SDL.EventType.GamepadAdded)
+                        {
+                            SDL.OpenGamepad(sdlEvent.GDevice.Which);
+                            Logger.Info("[SDL3] Gamepad connected (Ignored for wake).");
+                        }
+                        else if (eventType == SDL.EventType.GamepadRemoved)
+                        {
+                            var gamepad = SDL.GetGamepadFromID(sdlEvent.GDevice.Which);
+                            if (gamepad != IntPtr.Zero)
+                            {
+                                SDL.CloseGamepad(gamepad);
+                            }
+                            Logger.Info("[SDL3] Gamepad disconnected (Ignored for wake).");
+                        }
+                        else if (eventType == SDL.EventType.GamepadButtonDown)
+                        {
+                            Logger.Info("[TRIGGER] Gamepad button pressed.");
+                            inputDetected = true;
+                        }
+                        else if (eventType == SDL.EventType.GamepadAxisMotion)
+                        {
+                            // large deadzone to avoid stick drift waking the TV
+                            if (Math.Abs(sdlEvent.GAxis.Value) > 15000)
+                            {
+                                Logger.Info("[TRIGGER] Gamepad axis movement detected.");
+                                inputDetected = true;
+                            }
+                        }
                     }
-                    _lastGamepadPacket = (int)xState.dwPacketNumber;
                 }
 
                 if (inputDetected && (DateTime.UtcNow - _lastCommandTime) > _commandCooldown)
@@ -84,26 +125,17 @@ namespace Consoleify.GoogleTVNetworkCEC
                 _pollTimer.Stop();
                 _pollTimer.Dispose();
             }
+
+            if (_sdlInitialized)
+            {
+                SDL.Quit();
+            }
+
             base.Dispose(disposing);
         }
 
+        // global keyboard - sdl3 requires a focused window for this
         [DllImport("User32.dll")]
         private static extern short GetAsyncKeyState(int vKey);
-
-        [StructLayout(LayoutKind.Sequential)]
-        struct XINPUT_STATE
-        {
-            public uint dwPacketNumber;
-            public XINPUT_GAMEPAD Gamepad;
-        }
-        [StructLayout(LayoutKind.Sequential)]
-        struct XINPUT_GAMEPAD
-        {
-            public ushort wButtons;
-            public byte bLeftTrigger, bRightTrigger;
-            public short sThumbLX, sThumbLY, sThumbRX, sThumbRY;
-        }
-        [DllImport("xinput1_4.dll")]
-        private static extern int XInputGetState(int dwUserIndex, ref XINPUT_STATE pState);
     }
 }
